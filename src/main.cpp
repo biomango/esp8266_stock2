@@ -67,7 +67,7 @@ void loadConfig() {
   if (!error) {
     pageIntervalSec = doc["interval"] | 5;
     JsonArray array = doc["stocks"];
-    for (int i = 0; i < MAX_STOCKS && i < array.size(); i++) {
+    for (size_t i = 0; i < MAX_STOCKS && i < array.size(); i++) {
       strncpy(stocks[i].symbol, array[i]["sym"] | "", sizeof(stocks[i].symbol));
       strncpy(stocks[i].name, array[i]["name"] | "", sizeof(stocks[i].name));
     }
@@ -172,16 +172,16 @@ void countActiveStocks() {
 }
 
 void drawStockPage(int pageIndex) {
-  tft.fillScreen(0x000F); // 暗藍背景[cite: 5]
+  tft.fillScreen(0x000F); // 暗藍背景
 
   int totalPages = (totalActiveStocks + 3) / 4;
   if (totalPages == 0) totalPages = 1;
 
-  // 左側垂直標籤與頁碼[cite: 5]
+  // 左側垂直標籤與頁碼
   u8g2Font.setFont(u8g2_font_5x8_tr);
-  u8g2Font.setForegroundColor(ST7789_WHITE);
+  u8g2Font.setForegroundColor(ST77XX_WHITE);
   u8g2Font.setCursor(5, 110);
-  u8g2Font.print("STOCKS"); //[cite: 5]
+  u8g2Font.print("STOCKS");
 
   char pageStr[10];
   sprintf(pageStr, "%d/%d", pageIndex + 1, totalPages);
@@ -200,7 +200,7 @@ void drawStockPage(int pageIndex) {
 
     // 第一行：代碼與價格
     u8g2Font.setFont(u8g2_font_6x12_tr);
-    u8g2Font.setForegroundColor(ST7789_WHITE);
+    u8g2Font.setForegroundColor(ST77XX_WHITE);
     u8g2Font.setCursor(40, y);
     u8g2Font.print(stocks[stockIdx].symbol);
 
@@ -208,18 +208,18 @@ void drawStockPage(int pageIndex) {
     u8g2Font.setCursor(130, y);
     u8g2Font.print(stocks[stockIdx].price, (stocks[stockIdx].price >= 1000) ? 1 : 2);
 
-    // 第二行：中文名稱與漲跌幅[cite: 5]
+    // 第二行：中文名稱與漲跌幅
     u8g2Font.setFont(u8g2_font_unifont_t_chinese1);
-    u8g2Font.setForegroundColor(0x7BEF); // 淺灰[cite: 5]
+    u8g2Font.setForegroundColor(0x7BEF); // 淺灰
     u8g2Font.setCursor(40, y + 25);
     u8g2Font.print(stocks[stockIdx].name);
 
-    uint16_t color = (stocks[stockIdx].change_percent >= 0) ? ST7789_RED : ST7789_GREEN; //[cite: 5]
+    uint16_t color = (stocks[stockIdx].change_percent >= 0) ? ST77XX_RED : ST77XX_GREEN;
     char changeStr[15];
     if (stocks[stockIdx].change_percent >= 0) {
-      sprintf(changeStr, "+%.2f%%", stocks[stockIdx].change_percent); //[cite: 5]
+      sprintf(changeStr, "+%.2f%%", stocks[stockIdx].change_percent);
     } else {
-      sprintf(changeStr, "%.2f%%", stocks[stockIdx].change_percent); //[cite: 5]
+      sprintf(changeStr, "%.2f%%", stocks[stockIdx].change_percent);
     }
 
     u8g2Font.setForegroundColor(color);
@@ -246,10 +246,10 @@ void setup() {
   loadConfig();
   countActiveStocks();
 
-  // 初始化 ST7789 TFT[cite: 4]
+  // 初始化 ST7789 TFT
   tft.init(240, 240);
-  tft.setRotation(3); // 旋轉 270 度符合側向機構[cite: 5]
-  tft.fillScreen(ST7789_BLACK);
+  tft.setRotation(3); // 旋轉 270 度符合側向機構
+  tft.fillScreen(ST77XX_BLACK);
   u8g2Font.begin(tft);
 
   // 啟動 Wi-Fi
