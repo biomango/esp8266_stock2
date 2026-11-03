@@ -49,7 +49,7 @@ void handleSave();
 // ---------------------------------------------------------------------------
 void loadConfig() {
   if (!LittleFS.exists("/config.json")) {
-    // 預設預載 4 檔測試資料
+    // 預設載入 4 檔測試資料
     strcpy(stocks[0].symbol, "2330"); strcpy(stocks[0].name, "台積電"); stocks[0].price = 2425.0; stocks[0].change_percent = 1.04;
     strcpy(stocks[1].symbol, "2454"); strcpy(stocks[1].name, "聯發科"); stocks[1].price = 4235.0; stocks[1].change_percent = 6.94;
     strcpy(stocks[2].symbol, "0050"); strcpy(stocks[2].name, "元大台灣50"); stocks[2].price = 108.65; stocks[2].change_percent = -1.92;
@@ -252,7 +252,7 @@ void setup() {
   tft.fillScreen(ST7789_BLACK);
   u8g2Font.begin(tft);
 
-  // 啟動 Wi-Fi (可開啟 AP 基地台供手機連入 192.168.4.1 設定網頁)
+  // 啟動 Wi-Fi
   WiFi.mode(WIFI_AP_STA);
   WiFi.softAP("ESP8266-Stock-Ticker");
 
