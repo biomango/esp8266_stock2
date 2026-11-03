@@ -1,25 +1,14 @@
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
-#include <ESP8266HTTPClient.h>
-#include <WiFiClientSecure.h>
+#include <WiFiManager.h>
 #include <LittleFS.h>
 #include <ArduinoJson.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_ST7789.h>
+#include <TFT_eSPI.h>
 #include <SPI.h>
-#include <U8g2_for_Adafruit_GFX.h>
-
-// ---------------------------------------------------------------------------
-// 1. 硬體腳位定義與全域變數
-// ---------------------------------------------------------------------------
-#define TFT_CS    D8
-#define TFT_RST   D4
-#define TFT_DC    D3
 
 #define MAX_STOCKS 20
 
-Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_RST);
-U8G2_FOR_ADAFRUIT_GFX u8g2Font;
+TFT_eSPI tft = TFT_eSPI();
 ESP8266WebServer server(80);
 
 struct StockData {
@@ -45,22 +34,21 @@ void handleRoot();
 void handleSave();
 
 // ---------------------------------------------------------------------------
-// 2. LittleFS 檔案讀寫 (永久保存網頁設定數據)
+// LittleFS 檔案讀寫 (ArduinoJson v7 格式)
 // ---------------------------------------------------------------------------
 void loadConfig() {
   if (!LittleFS.exists("/config.json")) {
-    // 預設載入 4 檔測試資料
-    strcpy(stocks[0].symbol, "2330"); strcpy(stocks[0].name, "台積電"); stocks[0].price = 2425.0; stocks[0].change_percent = 1.04;
-    strcpy(stocks[1].symbol, "2454"); strcpy(stocks[1].name, "聯發科"); stocks[1].price = 4235.0; stocks[1].change_percent = 6.94;
-    strcpy(stocks[2].symbol, "0050"); strcpy(stocks[2].name, "元大台灣50"); stocks[2].price = 108.65; stocks[2].change_percent = -1.92;
-    strcpy(stocks[3].symbol, "2317"); strcpy(stocks[3].name, "鴻海"); stocks[3].price = 205.5; stocks[3].change_percent = 2.49;
+    strcpy(stocks[0].symbol, "2330"); strcpy(stocks[0].name, "2330"); stocks[0].price = 2425.0; stocks[0].change_percent = 1.04;
+    strcpy(stocks[1].symbol, "2454"); strcpy(stocks[1].name, "2454"); stocks[1].price = 4235.0; stocks[1].change_percent = 6.94;
+    strcpy(stocks[2].symbol, "0050"); strcpy(stocks[2].name, "0050"); stocks[2].price = 108.65; stocks[2].change_percent = -1.92;
+    strcpy(stocks[3].symbol, "2317"); strcpy(stocks[3].name, "2317"); stocks[3].price = 205.5; stocks[3].change_percent = 2.49;
     return;
   }
 
   File configFile = LittleFS.open("/config.json", "r");
   if (!configFile) return;
 
-  StaticJsonDocument<2048> doc;
+  JsonDocument doc;
   DeserializationError error = deserializeJson(doc, configFile);
   configFile.close();
 
@@ -75,12 +63,12 @@ void loadConfig() {
 }
 
 void saveConfig() {
-  StaticJsonDocument<2048> doc;
+  JsonDocument doc;
   doc["interval"] = pageIntervalSec;
-  JsonArray array = doc.createNestedArray("stocks");
+  JsonArray array = doc["stocks"].to<JsonArray>();
 
   for (int i = 0; i < MAX_STOCKS; i++) {
-    JsonObject obj = array.createNestedObject();
+    JsonObject obj = array.add<JsonObject>();
     obj["sym"] = stocks[i].symbol;
     obj["name"] = stocks[i].name;
   }
@@ -93,7 +81,7 @@ void saveConfig() {
 }
 
 // ---------------------------------------------------------------------------
-// 3. Web Server 網頁設定介面 (支援 20 股與秒數調整)
+// Web Server 網頁設定介面
 // ---------------------------------------------------------------------------
 void handleRoot() {
   String html = "<!DOCTYPE html><html><head><meta charset='UTF-8'>";
@@ -114,11 +102,9 @@ void handleRoot() {
   html += "<div class='card'><h2>📈 股票顯示器設定</h2>";
   html += "<form action='/save' method='POST'>";
 
-  // 秒數區塊
   html += "<div class='group'><label><b>⏱️ 頁面輪播時間 (秒)：</b></label>";
   html += "<input type='number' name='interval' value='" + String(pageIntervalSec) + "' min='1' max='60' required></div>";
 
-  // 20 檔股票列表區塊
   html += "<div class='group'><label><b>📋 股票清單 (最多 20 支)：</b></label>";
   for (int i = 0; i < MAX_STOCKS; i++) {
     html += "<div class='row'>";
@@ -157,7 +143,7 @@ void handleSave() {
 }
 
 // ---------------------------------------------------------------------------
-// 4. ST7789 (240x240) 繪圖與畫面輪播邏輯
+// TFT_eSPI 繪圖邏輯
 // ---------------------------------------------------------------------------
 void countActiveStocks() {
   totalActiveStocks = 0;
@@ -172,25 +158,22 @@ void countActiveStocks() {
 }
 
 void drawStockPage(int pageIndex) {
-  tft.fillScreen(0x000F); // 暗藍背景
+  tft.fillScreen(TFT_BLACK);
 
   int totalPages = (totalActiveStocks + 3) / 4;
   if (totalPages == 0) totalPages = 1;
 
-  // 左側垂直標籤與頁碼
-  u8g2Font.setFont(u8g2_font_5x8_tr);
-  u8g2Font.setForegroundColor(ST77XX_WHITE);
-  u8g2Font.setCursor(5, 110);
-  u8g2Font.print("STOCKS");
+  // 左側垂直標籤[cite: 5]
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawString("STOCKS", 5, 100, 2);
 
   char pageStr[10];
   sprintf(pageStr, "%d/%d", pageIndex + 1, totalPages);
-  u8g2Font.setCursor(5, 130);
-  u8g2Font.print(pageStr);
+  tft.drawString(pageStr, 5, 120, 2);
 
   int startIdx = pageIndex * 4;
-  int startY = 18;
-  int rowHeight = 55;
+  int startY = 10;
+  int rowHeight = 58;
 
   for (int i = 0; i < 4; i++) {
     int stockIdx = startIdx + i;
@@ -199,22 +182,18 @@ void drawStockPage(int pageIndex) {
     int y = startY + (i * rowHeight);
 
     // 第一行：代碼與價格
-    u8g2Font.setFont(u8g2_font_6x12_tr);
-    u8g2Font.setForegroundColor(ST77XX_WHITE);
-    u8g2Font.setCursor(40, y);
-    u8g2Font.print(stocks[stockIdx].symbol);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.drawString(stocks[stockIdx].symbol, 40, y, 4); // 字型 4 (清晰英數)
 
-    u8g2Font.setFont(u8g2_font_7x14_tr);
-    u8g2Font.setCursor(130, y);
-    u8g2Font.print(stocks[stockIdx].price, (stocks[stockIdx].price >= 1000) ? 1 : 2);
+    char priceStr[10];
+    dtostrf(stocks[stockIdx].price, 4, (stocks[stockIdx].price >= 1000) ? 1 : 2, priceStr);
+    tft.drawString(priceStr, 130, y, 4);
 
-    // 第二行：中文名稱與漲跌幅
-    u8g2Font.setFont(u8g2_font_unifont_t_chinese1);
-    u8g2Font.setForegroundColor(0x7BEF); // 淺灰
-    u8g2Font.setCursor(40, y + 25);
-    u8g2Font.print(stocks[stockIdx].name);
+    // 第二行：名稱與漲跌幅[cite: 5]
+    tft.setTextColor(TFT_SILVER, TFT_BLACK);
+    tft.drawString(stocks[stockIdx].name, 40, y + 26, 2);
 
-    uint16_t color = (stocks[stockIdx].change_percent >= 0) ? ST77XX_RED : ST77XX_GREEN;
+    uint16_t color = (stocks[stockIdx].change_percent >= 0) ? TFT_RED : TFT_GREEN;
     char changeStr[15];
     if (stocks[stockIdx].change_percent >= 0) {
       sprintf(changeStr, "+%.2f%%", stocks[stockIdx].change_percent);
@@ -222,18 +201,17 @@ void drawStockPage(int pageIndex) {
       sprintf(changeStr, "%.2f%%", stocks[stockIdx].change_percent);
     }
 
-    u8g2Font.setForegroundColor(color);
-    u8g2Font.setCursor(140, y + 25);
-    u8g2Font.print(changeStr);
+    tft.setTextColor(color, TFT_BLACK);
+    tft.drawString(changeStr, 140, y + 26, 2);
 
     if (i < 3 && (stockIdx + 1) < totalActiveStocks) {
-      tft.drawFastHLine(35, y + 32, 200, 0x18E3);
+      tft.drawFastHLine(35, y + 50, 200, TFT_DARKGREY);
     }
   }
 }
 
 // ---------------------------------------------------------------------------
-// 5. Arduino 主流程
+// 主流程
 // ---------------------------------------------------------------------------
 void setup() {
   Serial.begin(115200);
@@ -246,17 +224,19 @@ void setup() {
   loadConfig();
   countActiveStocks();
 
-  // 初始化 ST7789 TFT
-  tft.init(240, 240);
-  tft.setRotation(3); // 旋轉 270 度符合側向機構
-  tft.fillScreen(ST77XX_BLACK);
-  u8g2Font.begin(tft);
+  // 初始化 TFT_eSPI 螢幕
+  tft.init();
+  tft.setRotation(3); // 側向方向[cite: 5]
+  tft.fillScreen(TFT_BLACK);
 
-  // 啟動 Wi-Fi
-  WiFi.mode(WIFI_AP_STA);
-  WiFi.softAP("ESP8266-Stock-Ticker");
+  // 1. 使用 WiFiManager 配網 (若連不上 WiFi 會開 AP 供連線)
+  WiFiManager wm;
+  wm.setConfigPortalTimeout(180);
+  if (!wm.autoConnect("ESP8266-Stock-Ticker")) {
+    Serial.println("WiFi 配網逾時，進入獨立模式");
+  }
 
-  // 初始化 Web Server
+  // 2. 啟動 Web Server (連上 WiFi 後可輸入 ESP8266 的 IP 進入設定)
   server.on("/", handleRoot);
   server.on("/save", HTTP_POST, handleSave);
   server.begin();
@@ -267,7 +247,6 @@ void setup() {
 void loop() {
   server.handleClient();
 
-  // 依據網頁設定的 pageIntervalSec 秒數進行畫面自動輪播
   unsigned long intervalMs = pageIntervalSec * 1000;
   if (millis() - lastPageSwitch >= intervalMs) {
     lastPageSwitch = millis();
