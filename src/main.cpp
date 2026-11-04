@@ -42,8 +42,12 @@ struct Quote {
   float prev = 0;
   bool valid = false;
 };
+#define NAME_W 156            // 股名小圖尺寸 (由網頁設定頁的瀏覽器畫好後上傳)
+#define NAME_H 16
 char codes[MAX_STOCKS][8];
+char names[MAX_STOCKS][48];   // 證交所回傳的中文股名 (UTF-8)，只用來讓網頁畫圖
 Quote quotes[MAX_STOCKS];
+bool needRedraw = false;
 int nStocks = 0;
 int curPage = 0;
 int pages = 1;
@@ -166,16 +170,36 @@ void drawHeader() {
   }
   tft.drawString(buf, 4, 2, 2);
 
-  tft.setTextDatum(TC_DATUM);
-  if (!lastOk) tft.setTextColor(TFT_RED, bg);
-  else tft.setTextColor(marketOpen() ? TFT_GREEN : TFT_DARKGREY, bg);
-  tft.drawString(!lastOk ? "NET ERR" : (marketOpen() ? "OPEN" : "CLOSED"), 120, 2, 2);
+  // 狀態圓點：綠 = 開盤中，灰 = 收盤，紅 = 抓取失敗
+  uint16_t sc = !lastOk ? TFT_RED : (marketOpen() ? TFT_GREEN : TFT_DARKGREY);
+  tft.fillCircle(52, HEADER_H / 2, 4, sc);
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextColor(TFT_CYAN, bg);
+  tft.drawString(WiFi.localIP().toString(), 64, 2, 2);   // 本機 IP
 
   tft.setTextDatum(TR_DATUM);
   tft.setTextColor(TFT_WHITE, bg);
   snprintf(buf, sizeof(buf), "%d/%d", curPage + 1, pages);
   tft.drawString(buf, 236, 2, 2);
   tft.setTextDatum(TL_DATUM);
+}
+
+// 股名小圖：每像素 1 byte 亮度 (0~255)，畫成灰色 (184,184,184) 與 stock1 相同
+bool drawNameStrip(int x, int y, const char *code) {
+  File f = LittleFS.open(String("/n/") + code + ".bin", "r");
+  if (!f) return false;
+  uint8_t line[NAME_W];
+  uint16_t px[NAME_W];
+  for (int r = 0; r < NAME_H; r++) {
+    if (f.read(line, NAME_W) != NAME_W) break;
+    for (int c = 0; c < NAME_W; c++) {
+      uint8_t v = (uint16_t)line[c] * 184 / 255;
+      px[c] = ((v >> 3) << 11) | ((v >> 2) << 5) | (v >> 3);
+    }
+    tft.pushImage(x, y + r, NAME_W, 1, px);
+  }
+  f.close();
+  return true;
 }
 
 void drawRow(int slot, int idx) {
@@ -200,16 +224,24 @@ void drawRow(int slot, int idx) {
     tft.setTextColor(col, TFT_BLACK);
     tft.drawString(buf, 234, y0 + 4, 4);
 
-    snprintf(buf, sizeof(buf), "%+.2f (%+.2f%%)", chg, pct);
-    tft.drawString(buf, 234, y0 + 34, 2);
+    // 昨收：放在代號與現價之間；空間不夠時自動縮小字型，再不夠就不顯示
+    int right = 234 - tft.textWidth(buf, 4) - 8;
+    int left = 6 + tft.textWidth(codes[idx], 4) + 6;
+    char pv[16], yb[24];
+    fmtPrice(q.prev, pv, sizeof(pv));
+    snprintf(yb, sizeof(yb), "Y %s", pv);
+    int font = 2;
+    if (right - tft.textWidth(yb, 2) < left) font = 1;
+    if (right - tft.textWidth(yb, font) >= left) {
+      tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+      tft.drawString(yb, right, y0 + (font == 2 ? 9 : 13), font);
+      tft.setTextColor(col, TFT_BLACK);
+    }
 
-    char pbuf[16];
-    fmtPrice(q.prev, pbuf, sizeof(pbuf));
-    snprintf(buf, sizeof(buf), "Y %s", pbuf);
-    tft.setTextDatum(TL_DATUM);
-    tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
-    tft.drawString(buf, 6, y0 + 34, 2);
+    snprintf(buf, sizeof(buf), "%+.2f%%", pct);   // 與 stock1 相同：只顯示漲跌幅
+    tft.drawString(buf, 234, y0 + 34, 2);
   }
+  drawNameStrip(6, y0 + 34, codes[idx]);
   tft.drawFastHLine(0, y0 + ROW_H - 1, 240, 0x2104);
 }
 
@@ -280,7 +312,7 @@ int fetchBatchOnce(int start, int count) {
 
   JsonDocument filter;
   JsonObject f = filter["msgArray"].add<JsonObject>();
-  f["c"] = true; f["z"] = true; f["y"] = true; f["b"] = true;
+  f["c"] = true; f["n"] = true; f["z"] = true; f["y"] = true; f["b"] = true;
 
   JsonDocument doc;
   DeserializationError err = deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter));
@@ -309,6 +341,8 @@ int fetchBatchOnce(int start, int count) {
       quotes[i].price = price;
       quotes[i].prev = prev;
       quotes[i].valid = price > 0;
+      const char *nm = o["n"];
+      if (nm) strlcpy(names[i], nm, sizeof(names[i]));
     }
   }
   return doc["msgArray"].as<JsonArray>().size();
@@ -340,6 +374,25 @@ void doRefresh() {
 }
 
 // ---------------- 套用設定 ----------------
+void cleanNameFiles() {   // 刪除已不在清單內的股名圖
+  String del;
+  Dir d = LittleFS.openDir("/n");
+  while (d.next()) {
+    String fn = d.fileName();
+    String c = fn.substring(0, fn.indexOf('.'));
+    bool keep = false;
+    for (int i = 0; i < nStocks; i++) if (c.equalsIgnoreCase(codes[i])) keep = true;
+    if (!keep) del += fn + "|";
+  }
+  int from = 0;
+  while (true) {
+    int p = del.indexOf('|', from);
+    if (p < 0) break;
+    LittleFS.remove("/n/" + del.substring(from, p));
+    from = p + 1;
+  }
+}
+
 void applyConfig() {
   nStocks = 0;
   String s = cfg.codes + ",";
@@ -352,11 +405,13 @@ void applyConfig() {
     if ((t.length() >= 4 || t == "T00") && nStocks < MAX_STOCKS) {
       t.toCharArray(codes[nStocks], 8);
       quotes[nStocks] = Quote();
+      names[nStocks][0] = 0;
       nStocks++;
     }
   }
   pages = max(1, (nStocks + PER_PAGE - 1) / PER_PAGE);
   curPage = 0;
+  cleanNameFiles();
   tft.setRotation(cfg.rot);
   setBacklight(cfg.bright);
   tft.fillScreen(TFT_BLACK);
@@ -396,15 +451,47 @@ String htmlPage() {
   if (cfg.upRed) h += " checked";
   h += F("> 紅漲綠跌（台股習慣）</label><button type=submit>儲存</button></form>");
 
-  h += F("<h3>目前報價</h3><table><tr><th>代號</th><th>現價</th><th>昨收</th></tr>");
+  h += F("<h3>目前報價</h3><p id=ns style='color:#666'></p><table><tr><th>代號</th><th>名稱</th><th>現價</th><th>昨收</th></tr>");
   for (int i = 0; i < nStocks; i++) {
-    h += "<tr><td>" + String(codes[i]) + "</td><td>";
+    h += "<tr><td>" + String(codes[i]) + "</td><td>" + String(names[i]) + "</td><td>";
     if (quotes[i].valid) h += String(quotes[i].price, 2) + "</td><td>" + String(quotes[i].prev, 2);
     else h += String(everRefreshed ? "查無資料" : "等待中") + "</td><td>";
     h += "</td></tr>";
   }
-  h += F("</table><p><a href=/wifireset onclick=\"return confirm('清除 WiFi 設定並重開機？')\">重設 WiFi</a></p>"
-         "</body></html>");
+  h += F("</table><p><a href=/wifireset onclick=\"return confirm('清除 WiFi 設定並重開機？')\">重設 WiFi</a></p>");
+  // 股名小圖：小電視沒有中文字型，所以由瀏覽器把股名畫成 156x16 灰階圖，再上傳存進小電視
+  h += F(R"JS(<script>
+const W=156,H=16,FONT='"Microsoft JhengHei","PingFang TC","Noto Sans TC",sans-serif';
+function render(t){
+  const cv=document.createElement('canvas');cv.width=W;cv.height=H;
+  const g=cv.getContext('2d',{willReadFrequently:true});
+  g.fillStyle='#000';g.fillRect(0,0,W,H);
+  g.fillStyle='#fff';g.textBaseline='middle';
+  let s=14;g.font=s+'px '+FONT;
+  while(s>8&&g.measureText(t).width>W){s--;g.font=s+'px '+FONT;}
+  g.fillText(t,0,H/2+1);
+  const d=g.getImageData(0,0,W,H).data;let h='';
+  for(let i=0;i<W*H;i++)h+=(d[i*4]>>4).toString(16);
+  return h;
+}
+let tries=0;
+async function sync(){
+  const ns=document.getElementById('ns');
+  try{
+    const list=await (await fetch('/names')).json();
+    const done=new Set();let pending=0;
+    for(const it of list){
+      if(it.has||done.has(it.c))continue;
+      if(!it.n){pending++;continue;}
+      done.add(it.c);
+      await fetch('/name',{method:'POST',body:new URLSearchParams({code:it.c,d:render(it.n)})});
+    }
+    if(done.size){ns.textContent='股名已更新';setTimeout(()=>location.reload(),600);}
+    else if(pending&&++tries<20){ns.textContent='股名同步中…';setTimeout(sync,4000);}
+  }catch(e){ns.textContent='股名同步失敗：'+e;}
+}
+sync();
+</script></body></html>)JS");
   return h;
 }
 
@@ -421,6 +508,41 @@ void handleSave() {
   pendingApply = true;   // 由 loop() 套用，避免在抓資料途中改動陣列
   server.sendHeader("Location", "/");
   server.send(303);
+}
+
+void handleNames() {   // 給網頁設定頁用：目前每檔的股名，以及是否已有小圖
+  String j = "[";
+  for (int i = 0; i < nStocks; i++) {
+    if (i) j += ",";
+    String n;
+    for (const char *c = names[i]; *c; c++) if (*c != '"' && *c != '\\' && (uint8_t)*c >= 32) n += *c;
+    bool has = LittleFS.exists(String("/n/") + codes[i] + ".bin");
+    j += "{\"c\":\"" + String(codes[i]) + "\",\"n\":\"" + n + "\",\"has\":" + (has ? "true" : "false") + "}";
+  }
+  j += "]";
+  server.send(200, "application/json; charset=utf-8", j);
+}
+
+void handleName() {    // 接收瀏覽器畫好的股名圖 (156*16 個十六進位字元，每字元 4 bit 亮度)
+  String code = server.arg("code");
+  String d = server.arg("d");
+  bool ok = code.length() >= 3 && code.length() <= 6 && d.length() == NAME_W * NAME_H;
+  for (size_t i = 0; ok && i < code.length(); i++) if (!isalnum((unsigned char)code[i])) ok = false;
+  if (!ok) { server.send(400, "text/plain", "bad"); return; }
+  File f = LittleFS.open("/n/" + code + ".bin", "w");
+  if (!f) { server.send(500, "text/plain", "fs"); return; }
+  uint8_t buf[64];
+  size_t j = 0;
+  for (size_t i = 0; i < d.length(); i++) {
+    char ch = d[i];
+    int v = (ch >= '0' && ch <= '9') ? ch - '0' : ((ch | 32) >= 'a' && (ch | 32) <= 'f') ? (ch | 32) - 'a' + 10 : 0;
+    buf[j++] = v * 17;
+    if (j == sizeof(buf)) { f.write(buf, j); j = 0; }
+  }
+  if (j) f.write(buf, j);
+  f.close();
+  needRedraw = true;
+  server.send(200, "text/plain", "ok");
 }
 
 void handleWifiReset() {
@@ -441,6 +563,7 @@ void setup() {
   delay(100);
 
   if (!LittleFS.begin()) { LittleFS.format(); LittleFS.begin(); }
+  LittleFS.mkdir("/n");
   loadConfig();
 
   tft.init();
@@ -449,10 +572,27 @@ void setup() {
   setBacklight(cfg.bright);
   showMsg("StockTV", "Connecting WiFi...");
 
-  WiFiManager wm;
-  wm.setAPCallback(apCallback);
-  wm.setConfigPortalTimeout(180);
-  if (!wm.autoConnect("StockTV-Setup")) ESP.restart();
+  // 先直接連上次儲存的 WiFi；連不上才開設定頁，且設定頁開著時仍會每 25 秒重試已儲存的 WiFi
+  WiFi.mode(WIFI_STA);
+  WiFi.begin();
+  for (uint32_t t0 = millis(); WiFi.status() != WL_CONNECTED && millis() - t0 < 15000; ) delay(200);
+  if (WiFi.status() != WL_CONNECTED) {
+    showMsg("Setup WiFi", "Join WiFi: StockTV-Setup", "Open 192.168.4.1");
+    WiFiManager wm;
+    wm.setConfigPortalBlocking(false);
+    wm.startConfigPortal("StockTV-Setup");
+    uint32_t lastTry = millis();
+    while (WiFi.status() != WL_CONNECTED) {
+      wm.process();
+      if (!wm.getConfigPortalActive()) wm.startConfigPortal("StockTV-Setup");
+      if (WiFi.SSID().length() && millis() - lastTry > 25000) {
+        lastTry = millis();
+        WiFi.begin();
+      }
+      delay(5);
+    }
+    wm.stopConfigPortal();
+  }
 
   String ip = WiFi.localIP().toString();
   showMsg("Connected", ip.c_str(), "http://stocktv.local");
@@ -471,6 +611,8 @@ void setup() {
   server.on("/", HTTP_GET, handleRoot);
   server.on("/save", HTTP_POST, handleSave);
   server.on("/wifireset", HTTP_GET, handleWifiReset);
+  server.on("/names", HTTP_GET, handleNames);
+  server.on("/name", HTTP_POST, handleName);
   server.begin();
 
   delay(2500);
@@ -484,6 +626,11 @@ void loop() {
   if (pendingApply) {
     pendingApply = false;
     applyConfig();
+  }
+
+  if (needRedraw) {
+    needRedraw = false;
+    drawPage();
   }
 
   uint32_t now = millis();
