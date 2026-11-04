@@ -804,29 +804,53 @@ void setup() {
   LittleFS.mkdir("/n");
   loadConfig();
 
+  // 連續快速斷電重開 3 次 (每次都在開機完成前拔掉電源) -> 強制進入 WiFi 設定模式
+  bool forceSetup = false;
+  {
+    int cnt = 0;
+    File bf = LittleFS.open("/boot.cnt", "r");
+    if (bf) { cnt = bf.parseInt(); bf.close(); }
+    cnt++;
+    if (cnt >= 3) {
+      forceSetup = true;
+      LittleFS.remove("/boot.cnt");
+    } else {
+      File bw = LittleFS.open("/boot.cnt", "w");
+      if (bw) { bw.print(cnt); bw.close(); }
+    }
+  }
+
   tft.init();
   tft.setRotation(cfg.rot);
   tft.fillScreen(TFT_BLACK);
   setBacklight(cfg.bright);
   showMsg("StockTV", "Connecting WiFi...");
 
-  // 先直接連上次儲存的 WiFi；連不上才開設定頁，且設定頁開著時仍會每 25 秒重試已儲存的 WiFi
+  // 先直接連上次儲存的 WiFi；連不上 (或強制設定模式) 才開設定頁
   WiFi.mode(WIFI_STA);
-  WiFi.begin();
-  for (uint32_t t0 = millis(); WiFi.status() != WL_CONNECTED && millis() - t0 < 15000; ) delay(200);
-  if (WiFi.status() != WL_CONNECTED) {
+  if (forceSetup) {
+    WiFi.disconnect(false);   // 不要自動重連舊 WiFi，等使用者設定新的
+    delay(100);
+  } else {
+    WiFi.begin();
+    for (uint32_t t0 = millis(); WiFi.status() != WL_CONNECTED && millis() - t0 < 15000; ) delay(200);
+  }
+  if (forceSetup || WiFi.status() != WL_CONNECTED) {
     showMsg("Setup WiFi", "Join WiFi: StockTV-Setup", "Open 192.168.4.1");
     WiFiManager wm;
     wm.setConfigPortalBlocking(false);
     wm.startConfigPortal("StockTV-Setup");
-    uint32_t lastTry = millis();
+    uint32_t t0 = millis(), lastTry = millis();
     while (WiFi.status() != WL_CONNECTED) {
       wm.process();
       if (!wm.getConfigPortalActive()) wm.startConfigPortal("StockTV-Setup");
-      if (WiFi.SSID().length() && millis() - lastTry > 25000) {
+      // 有人連著設定熱點時不要重試舊 WiFi，否則切換頻道會把手機踢掉
+      if (WiFi.softAPgetStationNum() > 0) lastTry = millis();
+      if (!forceSetup && WiFi.SSID().length() && millis() - lastTry > 25000) {
         lastTry = millis();
         WiFi.begin();
       }
+      if (forceSetup && millis() - t0 > 300000UL) ESP.restart();   // 5 分鐘沒設定就恢復正常開機
       delay(5);
     }
     wm.stopConfigPortal();
@@ -860,6 +884,15 @@ void setup() {
 void loop() {
   server.handleClient();
   MDNS.update();
+
+  static bool bootCleared = false;
+  if (!bootCleared && millis() > 8000) {   // 順利開機超過 8 秒：清除快速重開計數
+    bootCleared = true;
+    LittleFS.remove("/boot.cnt");
+  }
+  static uint32_t lastConn = 0;
+  if (WiFi.status() == WL_CONNECTED) lastConn = millis();
+  else if (millis() - lastConn > 180000UL) ESP.restart();   // 斷線超過 3 分鐘 (例如換了路由器)：重開並進入設定頁
 
   if (pendingApply) {
     pendingApply = false;
