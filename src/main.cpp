@@ -42,12 +42,34 @@ struct Quote {
   float prev = 0;
   bool valid = false;
 };
-#define NAME_W 156            // 股名小圖尺寸 (由網頁設定頁的瀏覽器畫好後上傳)
-#define NAME_H 16
-char codes[MAX_STOCKS][8];
+#define NAME_W 100            // 股名小圖尺寸 (由網頁設定頁的瀏覽器畫好後上傳)
+#define NAME_H 22
+char codes[MAX_STOCKS][16];   // 台股 "2330"；美股 "usAAPL"；加密貨幣 "ccBTCUSDT"
 char names[MAX_STOCKS][48];   // 證交所回傳的中文股名 (UTF-8)，只用來讓網頁畫圖
 Quote quotes[MAX_STOCKS];
 bool needRedraw = false;
+bool twDone = false;      // 台股收盤後只需抓一次
+bool hasNonTw = false;    // 有美股/加密貨幣時，收盤也照常更新
+
+inline bool isUs(const char *c) { return c[0] == 'u' && c[1] == 's'; }
+inline bool isCc(const char *c) { return c[0] == 'c' && c[1] == 'c'; }
+inline bool isTw(const char *c) { return !isUs(c) && !isCc(c); }
+static const char *CRYPTO_QUOTES[] = {"FDUSD", "USDT", "USDC"};
+
+// 螢幕上顯示的代號：美股去掉 us、加密貨幣去掉 cc 與計價幣 (ccBTCUSDT -> BTC)
+void dispCode(const char *code, char *out, size_t n) {
+  if (isUs(code)) { strlcpy(out, code + 2, n); return; }
+  if (isCc(code)) {
+    strlcpy(out, code + 2, n);
+    size_t l = strlen(out);
+    for (auto q : CRYPTO_QUOTES) {
+      size_t ql = strlen(q);
+      if (l > ql && strcmp(out + l - ql, q) == 0) { out[l - ql] = 0; break; }
+    }
+    return;
+  }
+  strlcpy(out, code, n);
+}
 int nStocks = 0;
 int curPage = 0;
 int pages = 1;
@@ -73,19 +95,43 @@ bool marketOpen() {
   return m >= 8 * 60 + 55 && m <= 13 * 60 + 35;
 }
 
+// 代號正規化：台股 2330 / 00631L / T00(加權指數)；美股 usAAPL；加密貨幣 ccBTC (自動補 USDT)
+String normalizeToken(String t) {
+  t.toUpperCase();
+  if (t.length() > 2 && t.startsWith("TW")) t = t.substring(2);   // 相容 tw2330 寫法
+  if (t.length() > 2 && t.startsWith("US")) {
+    String b = t.substring(2);
+    return b.length() <= 8 ? "us" + b : String("");
+  }
+  if (t.length() > 2 && t.startsWith("CC")) {
+    String b = t.substring(2);
+    for (size_t i = 0; i < b.length(); i++) if (!isalnum((unsigned char)b[i])) return "";
+    bool hasQuote = false;
+    for (auto q : CRYPTO_QUOTES) if (b.length() > strlen(q) && b.endsWith(q)) hasQuote = true;
+    if (!hasQuote) b += "USDT";
+    return b.length() <= 12 ? "cc" + b : String("");
+  }
+  for (size_t i = 0; i < t.length(); i++) if (!isalnum((unsigned char)t[i])) return "";
+  if ((t.length() >= 4 && t.length() <= 6) || t == "T00") return t;
+  return "";
+}
+
 String sanitizeCodes(const String &in) {
   String out, tok;
   int n = 0;
   String src = in + "\n";
   for (size_t i = 0; i < src.length(); i++) {
     char c = src[i];
-    if (isalnum((unsigned char)c)) {
-      tok += (char)toupper((unsigned char)c);
+    if (isalnum((unsigned char)c) || c == '.' || c == '-') {
+      tok += c;
     } else {
-      if (((tok.length() >= 4 && tok.length() <= 6) || tok == "T00") && n < MAX_STOCKS) {
-        if (out.length()) out += ',';
-        out += tok;
-        n++;
+      if (tok.length() && n < MAX_STOCKS) {
+        String nt = normalizeToken(tok);
+        if (nt.length()) {
+          if (out.length()) out += ',';
+          out += nt;
+          n++;
+        }
       }
       tok = "";
     }
@@ -148,8 +194,10 @@ uint16_t colorFor(float chg) {
   return TFT_WHITE;
 }
 
-void fmtPrice(float p, char *buf, size_t n) {
-  if (p >= 1000) snprintf(buf, n, "%.1f", p);
+void fmtPrice(float p, char *buf, size_t n, bool crypto = false) {
+  if (p >= 10000) snprintf(buf, n, "%.0f", p);
+  else if (p >= 1000) snprintf(buf, n, "%.1f", p);
+  else if (crypto && p < 1) snprintf(buf, n, p >= 0.01f ? "%.4f" : "%.6f", p);
   else snprintf(buf, n, "%.2f", p);
 }
 
@@ -185,7 +233,16 @@ void drawHeader() {
 }
 
 // 股名小圖：每像素 1 byte 亮度 (0~255)，畫成灰色 (184,184,184) 與 stock1 相同
+bool nameFileOk(const char *code) {
+  File f = LittleFS.open(String("/n/") + code + ".bin", "r");
+  if (!f) return false;
+  bool ok = f.size() == NAME_W * NAME_H;   // 尺寸不符 (舊版小圖) 視為沒有，網頁會重新上傳
+  f.close();
+  return ok;
+}
+
 bool drawNameStrip(int x, int y, const char *code) {
+  if (!nameFileOk(code)) return false;
   File f = LittleFS.open(String("/n/") + code + ".bin", "r");
   if (!f) return false;
   uint8_t line[NAME_W];
@@ -207,9 +264,12 @@ void drawRow(int slot, int idx) {
   tft.fillRect(0, y0, 240, ROW_H, TFT_BLACK);
   if (idx >= nStocks) return;
   Quote &q = quotes[idx];
+  char dc[16];
+  dispCode(codes[idx], dc, sizeof(dc));
+  bool cc = isCc(codes[idx]);
   tft.setTextDatum(TL_DATUM);
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  tft.drawString(codes[idx], 6, y0 + 4, 4);
+  tft.drawString(dc, 6, y0 + 4, 4);
 
   tft.setTextDatum(TR_DATUM);
   if (!q.valid) {
@@ -220,28 +280,32 @@ void drawRow(int slot, int idx) {
     float pct = q.prev > 0 ? chg / q.prev * 100.0f : 0;
     uint16_t col = colorFor(chg);
     char buf[32];
-    fmtPrice(q.price, buf, sizeof(buf));
+    fmtPrice(q.price, buf, sizeof(buf), cc);
     tft.setTextColor(col, TFT_BLACK);
     tft.drawString(buf, 234, y0 + 4, 4);
 
-    // 昨收：放在代號與現價之間；空間不夠時自動縮小字型，再不夠就不顯示
-    int right = 234 - tft.textWidth(buf, 4) - 8;
-    int left = 6 + tft.textWidth(codes[idx], 4) + 6;
-    char pv[16], yb[24];
-    fmtPrice(q.prev, pv, sizeof(pv));
-    snprintf(yb, sizeof(yb), "Y %s", pv);
-    int font = 2;
-    if (right - tft.textWidth(yb, 2) < left) font = 1;
-    if (right - tft.textWidth(yb, font) >= left) {
-      tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
-      tft.drawString(yb, right, y0 + (font == 2 ? 9 : 13), font);
-      tft.setTextColor(col, TFT_BLACK);
-    }
-
-    snprintf(buf, sizeof(buf), "%+.2f%%", pct);   // 與 stock1 相同：只顯示漲跌幅
+    // 第二行右側：昨收 + 漲跌幅。空間不夠時昨收縮小字型，再不夠就不顯示
+    snprintf(buf, sizeof(buf), "%+.2f%%", pct);
     tft.drawString(buf, 234, y0 + 34, 2);
+    int wp = tft.textWidth(buf, 2);
+    char pv[16], yb[24];
+    fmtPrice(q.prev, pv, sizeof(pv), cc);
+    snprintf(yb, sizeof(yb), "Y %s", pv);
+    int limit = 6 + NAME_W + 4;                    // 股名區右緣
+    int font = 2;
+    if (234 - wp - 6 - tft.textWidth(yb, 2) < limit) font = 1;
+    if (234 - wp - 6 - tft.textWidth(yb, font) >= limit) {
+      tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+      tft.drawString(yb, 234 - wp - 6, y0 + (font == 2 ? 34 : 38), font);
+    }
   }
-  drawNameStrip(6, y0 + 34, codes[idx]);
+  if (isTw(codes[idx])) {
+    drawNameStrip(6, y0 + 31, codes[idx]);          // 台股：中文股名小圖
+  } else if (names[idx][0]) {                        // 美股：AAPL.OQ；加密貨幣：BTC/USDT
+    tft.setTextDatum(TL_DATUM);
+    tft.setTextColor(tft.color565(184, 184, 184), TFT_BLACK);
+    tft.drawString(names[idx], 6, y0 + 34, 2);
+  }
   tft.drawFastHLine(0, y0 + ROW_H - 1, 240, 0x2104);
 }
 
@@ -281,12 +345,13 @@ bool warmTw() {
 }
 
 // 回傳 -1 = 失敗，否則為回應中的股票筆數
-int fetchBatchOnce(int start, int count) {
+int fetchBatchOnce(const int *ids, int count) {
   String exch;
-  for (int i = start; i < start + count; i++) {
-    if (i > start) exch += "%7C";
-    if (strcmp(codes[i], "T00") == 0) exch += "tse_t00.tw";   // 加權指數只有上市
-    else exch += "tse_" + String(codes[i]) + ".tw%7Cotc_" + String(codes[i]) + ".tw";
+  for (int k = 0; k < count; k++) {
+    const char *cd = codes[ids[k]];
+    if (k) exch += "%7C";
+    if (strcmp(cd, "T00") == 0) exch += "tse_t00.tw";   // 加權指數只有上市
+    else exch += "tse_" + String(cd) + ".tw%7Cotc_" + String(cd) + ".tw";
   }
   String url = String("https://" TWSE_HOST "/stock/api/getStockInfo.jsp?ex_ch=") + exch + "&json=1&delay=0&_=" + String(millis());
 
@@ -325,7 +390,8 @@ int fetchBatchOnce(int start, int count) {
   for (JsonObject o : doc["msgArray"].as<JsonArray>()) {
     const char *c = o["c"];
     if (!c) continue;
-    for (int i = start; i < start + count; i++) {
+    for (int k = 0; k < count; k++) {
+      int i = ids[k];
       if (strcasecmp(codes[i], c) != 0) continue;
       float prev = o["y"].is<const char *>() ? atof(o["y"]) : 0;
       float price = 0;
@@ -348,26 +414,195 @@ int fetchBatchOnce(int start, int count) {
   return doc["msgArray"].as<JsonArray>().size();
 }
 
-bool fetchBatch(int start, int count) {
-  int n = fetchBatchOnce(start, count);
+bool fetchBatch(const int *ids, int count) {
+  int n = fetchBatchOnce(ids, count);
   if (n == 0) {                 // 空回應：session 可能過期，重新取 cookie 再試一次
     twCookie = "";
-    n = fetchBatchOnce(start, count);
+    n = fetchBatchOnce(ids, count);
   }
   return n >= 0;
 }
 
-void doRefresh() {
-  bool ok = true;
-  for (int s = 0; s < nStocks; s += BATCH) {
-    int c = min(BATCH, nStocks - s);
-    if (!fetchBatch(s, c)) ok = false;
-    uint32_t t = millis();
-    while (millis() - t < 1200) {   // 間隔 1.2 秒避免被證交所限流，期間仍處理網頁請求
-      server.handleClient();
-      delay(10);
+// ---- 美股：騰訊行情 (HTTP，GBK 編碼，只解析 ASCII 欄位)
+// 每行 v_usAAPL="200~蘋果~AAPL.OQ~現價~昨收~...";  欄位 [2]=代碼 [3]=現價 [4]=昨收
+int fetchUs(const int *ids, int count) {
+  String list;
+  for (int k = 0; k < count; k++) { if (k) list += ","; list += codes[ids[k]]; }
+  WiFiClient client;
+  HTTPClient http;
+  http.useHTTP10(true);
+  http.setTimeout(6000);
+  http.setUserAgent("Mozilla/5.0");
+  if (!http.begin(client, "http://qt.gtimg.cn/q=" + list)) return -1;
+  int code = http.GET();
+  if (code != 200) {
+    Serial.printf("US HTTP %d\n", code);
+    http.end();
+    return -1;
+  }
+  WiFiClient &st = http.getStream();
+  int found = 0;
+  uint32_t t0 = millis();
+  while ((st.connected() || st.available()) && millis() - t0 < 8000) {
+    if (!st.available()) { delay(5); continue; }
+    String line = st.readStringUntil('\n');
+    if (!line.startsWith("v_")) continue;
+    int eq = line.indexOf('=');
+    if (eq < 3) continue;
+    String sym = line.substring(2, eq);
+    String fld[5];
+    int fi = 0, from = eq + 2;                       // 跳過 ="
+    for (int p = from; p <= (int)line.length() && fi < 5; p++) {
+      if (p == (int)line.length() || line[p] == '~') { fld[fi++] = line.substring(from, p); from = p + 1; }
+    }
+    if (fi < 5) continue;
+    float price = fld[3].toFloat(), prev = fld[4].toFloat();
+    if (price <= 0) continue;
+    for (int k = 0; k < count; k++) {
+      int i = ids[k];
+      if (!sym.equalsIgnoreCase(codes[i])) continue;
+      quotes[i].price = price;
+      quotes[i].prev = prev > 0 ? prev : price;
+      quotes[i].valid = true;
+      strlcpy(names[i], fld[2].c_str(), sizeof(names[i]));
+      found++;
     }
   }
+  http.end();
+  return found;
+}
+
+// ---- 加密貨幣：Binance 公開 24h 行情 (漲跌為滾動 24 小時)
+bool mflnFor(const char *host) {   // 該主機是否支援小緩衝區 (省記憶體)，結果快取
+  static String hs[4];
+  static int8_t res[4];
+  static int n = 0;
+  for (int i = 0; i < n; i++) if (hs[i] == host) return res[i] == 1;
+  std::unique_ptr<BearSSL::WiFiClientSecure> p(new BearSSL::WiFiClientSecure);
+  p->setInsecure();
+  bool r = p->probeMaxFragmentLength(host, 443, 1024);
+  if (n < 4) { hs[n] = host; res[n] = r ? 1 : 0; n++; }
+  return r;
+}
+
+void applyCrypto(JsonObject o, const int *ids, int count) {
+  const char *sym = o["symbol"];
+  if (!sym) return;
+  float price = atof(o["lastPrice"] | "0");
+  float chg = atof(o["priceChange"] | "0");
+  if (price <= 0) return;
+  for (int k = 0; k < count; k++) {
+    int i = ids[k];
+    if (strcasecmp(codes[i] + 2, sym) != 0) continue;
+    quotes[i].price = price;
+    quotes[i].prev = (price - chg) > 0 ? price - chg : price;
+    quotes[i].valid = true;
+    char dc[16];
+    dispCode(codes[i], dc, sizeof(dc));
+    snprintf(names[i], sizeof(names[i]), "%s/%s", dc, codes[i] + 2 + strlen(dc));
+  }
+}
+
+// 回傳 -1 = 連線/解析失敗；0 = 查無此代號 (HTTP 400)；>0 = 筆數
+int fetchCryptoOnce(const char *host, const int *ids, int count) {
+  String url = String("https://") + host + "/api/v3/ticker/24hr?";
+  if (count == 1) {
+    url += "symbol=" + String(codes[ids[0]] + 2);
+  } else {
+    url += "symbols=%5B";
+    for (int k = 0; k < count; k++) {
+      if (k) url += "%2C";
+      url += "%22" + String(codes[ids[k]] + 2) + "%22";
+    }
+    url += "%5D";
+  }
+  bool small = mflnFor(host);
+  std::unique_ptr<BearSSL::WiFiClientSecure> client(new BearSSL::WiFiClientSecure);
+  client->setInsecure();
+  if (small) client->setBufferSizes(1024, 1024);
+  HTTPClient http;
+  http.useHTTP10(true);
+  http.setTimeout(8000);
+  http.setUserAgent("Mozilla/5.0");
+  if (!http.begin(*client, url)) return -1;
+  int code = http.GET();
+  if (code == 400) { http.end(); return 0; }
+  if (code != 200) {
+    Serial.printf("CC %s HTTP %d heap=%u\n", host, code, ESP.getFreeHeap());
+    http.end();
+    return -1;
+  }
+  JsonDocument filter;
+  if (count == 1) {
+    filter["symbol"] = true; filter["lastPrice"] = true; filter["priceChange"] = true;
+  } else {
+    filter[0]["symbol"] = true; filter[0]["lastPrice"] = true; filter[0]["priceChange"] = true;
+  }
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter));
+  http.end();
+  if (err) {
+    Serial.printf("CC JSON error: %s\n", err.c_str());
+    return -1;
+  }
+  if (doc.is<JsonArray>()) {
+    int n = 0;
+    for (JsonObject o : doc.as<JsonArray>()) { applyCrypto(o, ids, count); n++; }
+    return n;
+  }
+  applyCrypto(doc.as<JsonObject>(), ids, count);
+  return 1;
+}
+
+bool fetchCrypto(const int *ids, int count) {
+  static const char *HOSTS[] = {"api.binance.com", "data-api.binance.vision"};
+  for (auto h : HOSTS) {
+    int r = fetchCryptoOnce(h, ids, count);
+    if (count == 1 ? r >= 0 : r > 0) return true;
+  }
+  if (count > 1) {   // 批次失敗 (例如有一檔代號打錯)：逐檔重試，讓正確的仍能顯示
+    bool any = false;
+    for (int k = 0; k < count; k++) {
+      for (auto h : HOSTS) {
+        if (fetchCryptoOnce(h, ids + k, 1) >= 0) { any = true; break; }
+      }
+    }
+    return any;
+  }
+  return false;
+}
+
+void pauseServing(uint32_t ms) {   // 請求之間暫停，期間仍處理網頁請求
+  uint32_t t = millis();
+  while (millis() - t < ms) {
+    server.handleClient();
+    delay(10);
+  }
+}
+
+void doRefresh() {
+  bool ok = true;
+  int idx[MAX_STOCKS];
+  int n = 0;
+
+  for (int i = 0; i < nStocks; i++) if (isTw(codes[i])) idx[n++] = i;
+  if (n && (marketOpen() || !twDone)) {              // 台股收盤後只抓一次
+    bool twOk = true;
+    for (int s = 0; s < n; s += BATCH) {
+      if (!fetchBatch(idx + s, min(BATCH, n - s))) twOk = false;
+      pauseServing(1200);                            // 間隔 1.2 秒避免被證交所限流
+    }
+    if (twOk) twDone = true; else ok = false;
+  }
+
+  n = 0;
+  for (int i = 0; i < nStocks; i++) if (isUs(codes[i])) idx[n++] = i;
+  if (n && fetchUs(idx, n) < 0) ok = false;
+
+  n = 0;
+  for (int i = 0; i < nStocks; i++) if (isCc(codes[i])) idx[n++] = i;
+  if (n && !fetchCrypto(idx, n)) ok = false;
+
   lastOk = ok;
   everRefreshed = true;
   Serial.printf("refresh done ok=%d heap=%u\n", ok, ESP.getFreeHeap());
@@ -379,7 +614,7 @@ void cleanNameFiles() {   // 刪除已不在清單內的股名圖
   Dir d = LittleFS.openDir("/n");
   while (d.next()) {
     String fn = d.fileName();
-    String c = fn.substring(0, fn.indexOf('.'));
+    String c = fn.substring(0, fn.length() - 4);   // 去掉 .bin
     bool keep = false;
     for (int i = 0; i < nStocks; i++) if (c.equalsIgnoreCase(codes[i])) keep = true;
     if (!keep) del += fn + "|";
@@ -402,8 +637,8 @@ void applyConfig() {
     if (p < 0) break;
     String t = s.substring(from, p);
     from = p + 1;
-    if ((t.length() >= 4 || t == "T00") && nStocks < MAX_STOCKS) {
-      t.toCharArray(codes[nStocks], 8);
+    if (t.length() >= 3 && nStocks < MAX_STOCKS) {
+      t.toCharArray(codes[nStocks], 16);
       quotes[nStocks] = Quote();
       names[nStocks][0] = 0;
       nStocks++;
@@ -411,6 +646,9 @@ void applyConfig() {
   }
   pages = max(1, (nStocks + PER_PAGE - 1) / PER_PAGE);
   curPage = 0;
+  twDone = false;
+  hasNonTw = false;
+  for (int i = 0; i < nStocks; i++) if (!isTw(codes[i])) hasNonTw = true;
   cleanNameFiles();
   tft.setRotation(cfg.rot);
   setBacklight(cfg.bright);
@@ -433,7 +671,7 @@ String htmlPage() {
                "table{width:100%;border-collapse:collapse;margin-top:8px}"
                "td,th{border-bottom:1px solid #ccc;padding:4px;text-align:left}"
                "</style></head><body><h2>股票小電視設定</h2><form method=POST action=/save>");
-  h += F("<label>自選股代號（最多 20 檔；逗號、空白或換行分隔；上市上櫃自動判斷）</label>"
+  h += F("<label>自選股（最多 20 檔；逗號、空白或換行分隔）<br><small style=\"font-weight:normal\">台股直接輸入代號（2330、0050，上市上櫃自動判斷，T00 為加權指數）；美股加 us（usAAPL）；加密貨幣加 cc（ccBTC、ccETH）</small></label>"
          "<textarea name=stocks rows=4>");
   h += cfg.codes;
   h += F("</textarea>");
@@ -461,14 +699,14 @@ String htmlPage() {
   h += F("</table><p><a href=/wifireset onclick=\"return confirm('清除 WiFi 設定並重開機？')\">重設 WiFi</a></p>");
   // 股名小圖：小電視沒有中文字型，所以由瀏覽器把股名畫成 156x16 灰階圖，再上傳存進小電視
   h += F(R"JS(<script>
-const W=156,H=16,FONT='"Microsoft JhengHei","PingFang TC","Noto Sans TC",sans-serif';
+const W=100,H=22,FONT='"Microsoft JhengHei","PingFang TC","Noto Sans TC",sans-serif';
 function render(t){
   const cv=document.createElement('canvas');cv.width=W;cv.height=H;
   const g=cv.getContext('2d',{willReadFrequently:true});
   g.fillStyle='#000';g.fillRect(0,0,W,H);
   g.fillStyle='#fff';g.textBaseline='middle';
-  let s=14;g.font=s+'px '+FONT;
-  while(s>8&&g.measureText(t).width>W){s--;g.font=s+'px '+FONT;}
+  let s=18;g.font=s+'px '+FONT;
+  while(s>9&&g.measureText(t).width>W){s--;g.font=s+'px '+FONT;}
   g.fillText(t,0,H/2+1);
   const d=g.getImageData(0,0,W,H).data;let h='';
   for(let i=0;i<W*H;i++)h+=(d[i*4]>>4).toString(16);
@@ -516,7 +754,7 @@ void handleNames() {   // 給網頁設定頁用：目前每檔的股名，以及
     if (i) j += ",";
     String n;
     for (const char *c = names[i]; *c; c++) if (*c != '"' && *c != '\\' && (uint8_t)*c >= 32) n += *c;
-    bool has = LittleFS.exists(String("/n/") + codes[i] + ".bin");
+    bool has = !isTw(codes[i]) || nameFileOk(codes[i]);
     j += "{\"c\":\"" + String(codes[i]) + "\",\"n\":\"" + n + "\",\"has\":" + (has ? "true" : "false") + "}";
   }
   j += "]";
@@ -634,7 +872,7 @@ void loop() {
   }
 
   uint32_t now = millis();
-  uint32_t interval = marketOpen() ? (uint32_t)cfg.refreshSec * 1000UL : 600000UL;
+  uint32_t interval = (marketOpen() || hasNonTw) ? (uint32_t)cfg.refreshSec * 1000UL : 600000UL;
   if (nStocks > 0 && (needRefresh || now - lastRefresh >= interval)) {
     needRefresh = false;
     doRefresh();
