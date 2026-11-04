@@ -78,7 +78,7 @@ String sanitizeCodes(const String &in) {
     if (isalnum((unsigned char)c)) {
       tok += (char)toupper((unsigned char)c);
     } else {
-      if (tok.length() >= 4 && tok.length() <= 6 && n < MAX_STOCKS) {
+      if (((tok.length() >= 4 && tok.length() <= 6) || tok == "T00") && n < MAX_STOCKS) {
         if (out.length()) out += ',';
         out += tok;
         n++;
@@ -248,13 +248,15 @@ bool warmTw() {
   return twCookie.length() > 0;
 }
 
-bool fetchBatch(int start, int count) {
+// 回傳 -1 = 失敗，否則為回應中的股票筆數
+int fetchBatchOnce(int start, int count) {
   String exch;
   for (int i = start; i < start + count; i++) {
     if (i > start) exch += "%7C";
-    exch += "tse_" + String(codes[i]) + ".tw%7Cotc_" + String(codes[i]) + ".tw";
+    if (strcmp(codes[i], "T00") == 0) exch += "tse_t00.tw";   // 加權指數只有上市
+    else exch += "tse_" + String(codes[i]) + ".tw%7Cotc_" + String(codes[i]) + ".tw";
   }
-  String url = String("https://" TWSE_HOST "/stock/api/getStockInfo.jsp?ex_ch=") + exch + "&json=1&delay=0";
+  String url = String("https://" TWSE_HOST "/stock/api/getStockInfo.jsp?ex_ch=") + exch + "&json=1&delay=0&_=" + String(millis());
 
   if (twCookie.length() == 0) warmTw();   // 先暖機，且不與下面的 TLS 連線同時存在以省記憶體
 
@@ -266,14 +268,14 @@ bool fetchBatch(int start, int count) {
   http.useHTTP10(true);          // 避免 chunked，才能直接串流解析 JSON
   http.setTimeout(8000);
   http.setUserAgent("Mozilla/5.0");
-  if (!http.begin(*client, url)) return false;
+  if (!http.begin(*client, url)) return -1;
   if (twCookie.length()) http.addHeader("Cookie", twCookie);
   http.addHeader("Referer", "https://" TWSE_HOST "/stock/index.jsp");
   int code = http.GET();
   if (code != 200) {
     Serial.printf("HTTP %d, heap=%u\n", code, ESP.getFreeHeap());
     http.end();
-    return false;
+    return -1;
   }
 
   JsonDocument filter;
@@ -285,14 +287,14 @@ bool fetchBatch(int start, int count) {
   http.end();
   if (err) {
     Serial.printf("JSON error: %s\n", err.c_str());
-    return false;
+    return -1;
   }
 
   for (JsonObject o : doc["msgArray"].as<JsonArray>()) {
     const char *c = o["c"];
     if (!c) continue;
     for (int i = start; i < start + count; i++) {
-      if (strcmp(codes[i], c) != 0) continue;
+      if (strcasecmp(codes[i], c) != 0) continue;
       float prev = o["y"].is<const char *>() ? atof(o["y"]) : 0;
       float price = 0;
       const char *z = o["z"];
@@ -309,7 +311,16 @@ bool fetchBatch(int start, int count) {
       quotes[i].valid = price > 0;
     }
   }
-  return true;
+  return doc["msgArray"].as<JsonArray>().size();
+}
+
+bool fetchBatch(int start, int count) {
+  int n = fetchBatchOnce(start, count);
+  if (n == 0) {                 // 空回應：session 可能過期，重新取 cookie 再試一次
+    twCookie = "";
+    n = fetchBatchOnce(start, count);
+  }
+  return n >= 0;
 }
 
 void doRefresh() {
@@ -338,7 +349,7 @@ void applyConfig() {
     if (p < 0) break;
     String t = s.substring(from, p);
     from = p + 1;
-    if (t.length() >= 4 && nStocks < MAX_STOCKS) {
+    if ((t.length() >= 4 || t == "T00") && nStocks < MAX_STOCKS) {
       t.toCharArray(codes[nStocks], 8);
       quotes[nStocks] = Quote();
       nStocks++;
